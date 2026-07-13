@@ -51,6 +51,15 @@ type DispatchRequest = {
   checkpointPollSeconds?: unknown
   missionId?: unknown
   missionTitle?: unknown
+  authoritySystem?: unknown
+  authorityId?: unknown
+  authorityUrl?: unknown
+  repositoryPath?: unknown
+  githubUrl?: unknown
+  initiatedBy?: unknown
+  returnSessionKey?: unknown
+  tokenLimit?: unknown
+  stopCondition?: unknown
   direct?: unknown
   notifySessionKey?: unknown
 }
@@ -1091,6 +1100,24 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
   const notifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim() ? body.notifySessionKey.trim() : 'main'
 
+  const authoritySystem = body.authoritySystem === 'desktop' || body.authoritySystem === 'github' || body.authoritySystem === 'paperclip'
+    ? body.authoritySystem
+    : null
+  const authorityId = typeof body.authorityId === 'string' ? body.authorityId.trim() : ''
+  const authorityUrl = typeof body.authorityUrl === 'string' ? body.authorityUrl.trim() : ''
+  const authorityFieldCount = [authoritySystem, authorityId, authorityUrl].filter(Boolean).length
+  if (authorityFieldCount > 0 && authorityFieldCount < 3) {
+    throw new SwarmDispatchError('authoritySystem, authorityId, and authorityUrl must be provided together')
+  }
+  const repositoryPath = typeof body.repositoryPath === 'string' && body.repositoryPath.trim() ? body.repositoryPath.trim() : null
+  const githubUrl = typeof body.githubUrl === 'string' && body.githubUrl.trim() ? body.githubUrl.trim() : null
+  const initiatedBy = typeof body.initiatedBy === 'string' && body.initiatedBy.trim() ? body.initiatedBy.trim() : null
+  const returnSessionKey = typeof body.returnSessionKey === 'string' && body.returnSessionKey.trim() ? body.returnSessionKey.trim() : null
+  const tokenLimit = typeof body.tokenLimit === 'number' && Number.isFinite(body.tokenLimit) && body.tokenLimit > 0
+    ? Math.floor(body.tokenLimit)
+    : null
+  const stopCondition = typeof body.stopCondition === 'string' && body.stopCondition.trim() ? body.stopCondition.trim() : null
+
   const requestedMissionId = typeof body.missionId === 'string' ? body.missionId.trim() : ''
   const hasExplicitMissionTitle = typeof body.missionTitle === 'string' && body.missionTitle.trim()
   const missionTitle = hasExplicitMissionTitle
@@ -1099,6 +1126,11 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   const mission = createOrUpdateMission({
     missionId: requestedMissionId || null,
     title: missionTitle,
+    authority: authoritySystem ? { system: authoritySystem, id: authorityId, url: authorityUrl } : undefined,
+    repository: repositoryPath || githubUrl ? { localPath: repositoryPath, githubUrl } : undefined,
+    initiatedBy,
+    returnSessionKey,
+    budget: tokenLimit || stopCondition ? { tokenLimit, stopCondition } : undefined,
     assignments,
   })
   if (mission._created) {

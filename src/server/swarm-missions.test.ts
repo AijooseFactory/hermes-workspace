@@ -25,6 +25,42 @@ describe('swarm-missions', () => {
     try { rmSync(tempRoot, { recursive: true, force: true }) } catch { /* ignore */ }
   })
 
+  it('stores one structured authoritative task reference without creating a duplicate task record', async () => {
+    const mod = await loadModule()
+    const mission = mod.createOrUpdateMission({
+      missionId: 'mission-authority-1',
+      title: 'Desktop-first routing proof',
+      authority: {
+        system: 'paperclip',
+        id: 'AIJ-99',
+        url: 'http://127.0.0.1:3100/AIJ/issues/AIJ-99',
+      },
+      repository: {
+        localPath: '/tmp/routing-proof',
+        githubUrl: 'https://github.com/AijooseFactory/routing-proof',
+      },
+      initiatedBy: 'hermes-desktop',
+      returnSessionKey: 'desktop-session-1',
+      budget: { tokenLimit: 2000, stopCondition: 'Stop after verification.' },
+      assignments: [{ workerId: 'builder', task: 'Verify routing contract', reviewRequired: false }],
+    })
+
+    expect(mission.authority).toEqual({
+      system: 'paperclip',
+      id: 'AIJ-99',
+      url: 'http://127.0.0.1:3100/AIJ/issues/AIJ-99',
+    })
+    expect(mission.repository?.githubUrl).toContain('AijooseFactory/routing-proof')
+    expect(mission.initiatedBy).toBe('hermes-desktop')
+    expect(mission.returnSessionKey).toBe('desktop-session-1')
+    expect(mission.budget?.tokenLimit).toBe(2000)
+    expect(mission.events[0]?.data?.authorityId).toBe('AIJ-99')
+
+    const persisted = mod.getSwarmMission(mission.id)
+    expect(persisted?.authority?.id).toBe('AIJ-99')
+    expect(persisted?.assignments).toHaveLength(1)
+  })
+
   it('records checkpoints by assignment id, stores report metadata, and exposes flattened reports', async () => {
     const mod = await loadModule()
     const mission = mod.createOrUpdateMission({
