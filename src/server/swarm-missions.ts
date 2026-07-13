@@ -21,6 +21,22 @@ export type SwarmMissionAssignment = {
   checkpoint: ParsedSwarmCheckpoint | null
 }
 
+export type SwarmMissionAuthority = {
+  system: 'desktop' | 'github' | 'paperclip'
+  id: string
+  url: string
+}
+
+export type SwarmMissionRepository = {
+  localPath: string | null
+  githubUrl: string | null
+}
+
+export type SwarmMissionBudget = {
+  tokenLimit: number | null
+  stopCondition: string | null
+}
+
 export type SwarmMissionEvent = {
   id: string
   type: 'created' | 'assignment_dispatched' | 'checkpoint' | 'continuation' | 'review' | 'blocked' | 'assignment_cancelled' | 'mission_cancelled'
@@ -50,6 +66,11 @@ export type SwarmCheckpointReport = {
 export type SwarmMission = {
   id: string
   title: string
+  authority?: SwarmMissionAuthority | null
+  repository?: SwarmMissionRepository | null
+  initiatedBy?: string | null
+  returnSessionKey?: string | null
+  budget?: SwarmMissionBudget | null
   state: SwarmMissionState
   createdAt: number
   updatedAt: number
@@ -172,6 +193,11 @@ export type CreateOrUpdateMissionResult = SwarmMission & { _created?: boolean }
 export function createOrUpdateMission(input: {
   missionId?: string | null
   title: string
+  authority?: SwarmMissionAuthority | null
+  repository?: SwarmMissionRepository | null
+  initiatedBy?: string | null
+  returnSessionKey?: string | null
+  budget?: SwarmMissionBudget | null
   assignments: Array<{ workerId: string; task: string; rationale?: string | null; dependsOn?: Array<string>; reviewRequired?: boolean }>
 }): CreateOrUpdateMissionResult {
   const store = readStore()
@@ -183,17 +209,35 @@ export function createOrUpdateMission(input: {
     mission = {
       id: missionId,
       title: input.title || 'Untitled swarm mission',
+      authority: input.authority ?? null,
+      repository: input.repository ?? null,
+      initiatedBy: input.initiatedBy ?? null,
+      returnSessionKey: input.returnSessionKey ?? null,
+      budget: input.budget ?? null,
       state: 'planning',
       createdAt,
       updatedAt: createdAt,
       assignments: [],
-      events: [event('created', `Mission created: ${input.title || missionId}`)],
+      events: [event('created', `Mission created: ${input.title || missionId}`, {
+        data: input.authority ? {
+          authoritySystem: input.authority.system,
+          authorityId: input.authority.id,
+          authorityUrl: input.authority.url,
+        } : undefined,
+      })],
     }
     store.missions.push(mission)
     createdMission = true
   }
 
+  if (!mission) throw new Error(`Failed to create mission ${missionId}`)
+
   mission.title = input.title || mission.title
+  if (input.authority !== undefined) mission.authority = input.authority
+  if (input.repository !== undefined) mission.repository = input.repository
+  if (input.initiatedBy !== undefined) mission.initiatedBy = input.initiatedBy
+  if (input.returnSessionKey !== undefined) mission.returnSessionKey = input.returnSessionKey
+  if (input.budget !== undefined) mission.budget = input.budget
   for (const assignment of input.assignments) {
     const existing = mission.assignments.find((item) => item.workerId === assignment.workerId && item.task === assignment.task)
     if (existing) continue
