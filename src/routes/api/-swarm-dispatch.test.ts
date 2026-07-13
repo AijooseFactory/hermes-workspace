@@ -1,13 +1,73 @@
-import { describe, expect, it } from 'vitest'
+import { rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createOrUpdateMission } from '../../server/swarm-missions'
 import {
   buildHermesChatQueryArgs,
   buildHermesTmuxLaunchCommand,
   buildWorkerPrompt,
   checkpointFromRuntimeSnapshot,
   dispatchBlockReason,
+  dispatchSwarmAssignments,
   runtimeCheckpointSignature,
   runtimeSnapshotIsFresh,
 } from './swarm-dispatch'
+
+const tempRoot = vi.hoisted(() => `/tmp/swarm-dispatch-test-${process.pid}-${Date.now()}`)
+
+vi.mock('../../server/swarm-environment', () => ({
+  SWARM_CANONICAL_REPO: tempRoot,
+}))
+
+vi.mock('node:child_process', () => ({
+  execFile: vi.fn((...args: Array<unknown>) => {
+    const callback = args.at(-1) as (error: Error, stdout: string, stderr: string) => void
+    queueMicrotask(() => callback(new Error('command unavailable in test'), '', ''))
+    return { stdin: { end: vi.fn() }, on: vi.fn() }
+  }),
+}))
+
+vi.mock('../../server/swarm-memory', () => ({
+  appendSwarmMemoryEvent: vi.fn(),
+  buildSwarmStartupSnapshot: vi.fn(() => ({ rendered: '' })),
+}))
+
+vi.mock('../../server/swarm-profile-config', () => ({
+  ensureSwarmProfileConfig: vi.fn(),
+}))
+
+const originalHermesHome = process.env.HERMES_HOME
+
+afterEach(() => {
+  if (originalHermesHome === undefined) delete process.env.HERMES_HOME
+  else process.env.HERMES_HOME = originalHermesHome
+  rmSync(tempRoot, { recursive: true, force: true })
+})
+
+describe('dispatchSwarmAssignments', () => {
+  it('preserves mission initiator metadata when an update omits both fields', async () => {
+    process.env.HERMES_HOME = join(tempRoot, 'hermes')
+    const existingMission = createOrUpdateMission({
+      missionId: 'mission-metadata-1',
+      title: 'Preserve dispatch metadata',
+      initiatedBy: 'hermes-desktop',
+      returnSessionKey: 'desktop-session-1',
+      assignments: [{ workerId: 'missing-test-worker', task: 'Start existing mission' }],
+    })
+
+    const result = await dispatchSwarmAssignments({
+      missionId: existingMission.id,
+      assignments: [{ workerId: 'missing-test-worker', task: 'Continue existing mission' }],
+      waitForCheckpoint: false,
+      allowAsync: true,
+    })
+
+    expect(result.mission).toMatchObject({
+      initiatedBy: 'hermes-desktop',
+      returnSessionKey: 'desktop-session-1',
+    })
+  })
+})
 
 describe('checkpointFromRuntimeSnapshot', () => {
   it('maps runtime lifecycle fields into a structured checkpoint', () => {

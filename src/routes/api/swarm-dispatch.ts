@@ -1111,8 +1111,12 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   }
   const repositoryPath = typeof body.repositoryPath === 'string' && body.repositoryPath.trim() ? body.repositoryPath.trim() : null
   const githubUrl = typeof body.githubUrl === 'string' && body.githubUrl.trim() ? body.githubUrl.trim() : null
-  const initiatedBy = typeof body.initiatedBy === 'string' && body.initiatedBy.trim() ? body.initiatedBy.trim() : null
-  const returnSessionKey = typeof body.returnSessionKey === 'string' && body.returnSessionKey.trim() ? body.returnSessionKey.trim() : null
+  const initiatedBy = body.initiatedBy === undefined
+    ? undefined
+    : typeof body.initiatedBy === 'string' && body.initiatedBy.trim() ? body.initiatedBy.trim() : null
+  const returnSessionKey = body.returnSessionKey === undefined
+    ? undefined
+    : typeof body.returnSessionKey === 'string' && body.returnSessionKey.trim() ? body.returnSessionKey.trim() : null
   const tokenLimit = typeof body.tokenLimit === 'number' && Number.isFinite(body.tokenLimit) && body.tokenLimit > 0
     ? Math.floor(body.tokenLimit)
     : null
