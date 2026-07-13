@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path'
 import { SWARM_CANONICAL_REPO } from './swarm-environment'
 import type { ParsedSwarmCheckpoint } from './swarm-checkpoints'
+import { getSwarmProfilePath } from './swarm-foundation'
+import { readWorkerTokenUsage, type SwarmTokenUsageSnapshot } from './swarm-token-usage'
 
 export type SwarmMissionAssignmentState = 'queued' | 'dispatched' | 'checkpointed' | 'blocked' | 'needs_input' | 'reviewing' | 'done' | 'cancelled'
 export type SwarmMissionState = 'planning' | 'dispatching' | 'executing' | 'reviewing' | 'blocked' | 'complete' | 'cancelled'
@@ -19,10 +21,12 @@ export type SwarmMissionAssignment = {
   reviewedAt: number | null
   reviewedBy: string | null
   checkpoint: ParsedSwarmCheckpoint | null
+  tokenBaseline?: SwarmTokenUsageSnapshot | null
+  tokenUsage?: SwarmMissionTokenUsage | null
 }
 
 export type SwarmMissionAuthority = {
-  system: 'desktop' | 'github' | 'paperclip'
+  system: 'desktop' | 'github' | 'paperclip' | 'project'
   id: string
   url: string
 }
@@ -33,8 +37,19 @@ export type SwarmMissionRepository = {
 }
 
 export type SwarmMissionBudget = {
+  mode?: 'advisory'
   tokenLimit: number | null
   stopCondition: string | null
+}
+
+export type SwarmMissionTokenUsage = {
+  available: boolean
+  source: 'state.db:sessions'
+  measuredAt: number
+  inputTokens: number | null
+  outputTokens: number | null
+  totalTokens: number | null
+  overBudget: boolean | null
 }
 
 export type SwarmMissionEvent = {
@@ -61,6 +76,7 @@ export type SwarmCheckpointReport = {
   blocker: string | null
   nextAction: string | null
   source: string
+  tokenUsage?: SwarmMissionTokenUsage | null
 }
 
 export type SwarmMission = {
@@ -71,6 +87,8 @@ export type SwarmMission = {
   initiatedBy?: string | null
   returnSessionKey?: string | null
   budget?: SwarmMissionBudget | null
+  workMode?: 'direct' | 'governed' | 'autonomous'
+  tokenUsage?: SwarmMissionTokenUsage | null
   state: SwarmMissionState
   createdAt: number
   updatedAt: number
@@ -97,7 +115,12 @@ function readStore(): SwarmMissionStore {
   if (!existsSync(SWARM_MISSIONS_PATH)) return { version: 1, missions: [] }
   try {
     const parsed = JSON.parse(readFileSync(SWARM_MISSIONS_PATH, 'utf8')) as SwarmMissionStore
-    return { version: 1, missions: Array.isArray(parsed.missions) ? parsed.missions : [] }
+    const missions = Array.isArray(parsed.missions) ? parsed.missions : []
+    for (const mission of missions) {
+      mission.workMode ??= 'direct'
+      if (mission.budget) mission.budget.mode ??= 'advisory'
+    }
+    return { version: 1, missions }
   } catch {
     return { version: 1, missions: [] }
   }
@@ -120,6 +143,7 @@ function reportFromCheckpoint(input: {
   workerId: string
   checkpoint: ParsedSwarmCheckpoint
   source?: string | null
+  tokenUsage?: SwarmMissionTokenUsage | null
 }): SwarmCheckpointReport {
   return {
     missionId: input.missionId,
@@ -135,6 +159,7 @@ function reportFromCheckpoint(input: {
     blocker: input.checkpoint.blocker,
     nextAction: input.checkpoint.nextAction,
     source: input.source?.trim() || 'unknown',
+    tokenUsage: input.tokenUsage ?? null,
   }
 }
 
@@ -158,6 +183,36 @@ const TERMINAL_ASSIGNMENT_STATES = new Set<SwarmMissionAssignmentState>(['done',
 
 function isTerminalAssignment(assignment: SwarmMissionAssignment): boolean {
   return TERMINAL_ASSIGNMENT_STATES.has(assignment.state)
+}
+
+function unavailableTokenUsage(measuredAt = now()): SwarmMissionTokenUsage {
+  return { available: false, source: 'state.db:sessions', measuredAt, inputTokens: null, outputTokens: null, totalTokens: null, overBudget: null }
+}
+
+function measureAssignmentTokenUsage(assignment: SwarmMissionAssignment, tokenLimit: number | null): void {
+  const current = readWorkerTokenUsage(getSwarmProfilePath(assignment.workerId))
+  const baseline = assignment.tokenBaseline
+  if (!baseline?.available || !current.available) {
+    assignment.tokenUsage = unavailableTokenUsage(current.measuredAt)
+    return
+  }
+  const inputTokens = Math.max(0, (current.inputTokens ?? 0) - (baseline.inputTokens ?? 0))
+  const outputTokens = Math.max(0, (current.outputTokens ?? 0) - (baseline.outputTokens ?? 0))
+  const totalTokens = inputTokens + outputTokens
+  assignment.tokenUsage = { available: true, source: current.source, measuredAt: current.measuredAt, inputTokens, outputTokens, totalTokens, overBudget: tokenLimit === null ? false : totalTokens > tokenLimit }
+}
+
+function aggregateMissionTokenUsage(mission: SwarmMission): void {
+  const measured = mission.assignments.map((assignment) => assignment.tokenUsage).filter((usage): usage is SwarmMissionTokenUsage => Boolean(usage?.available))
+  if (measured.length === 0) {
+    mission.tokenUsage = unavailableTokenUsage()
+    return
+  }
+  const inputTokens = measured.reduce((sum, usage) => sum + (usage.inputTokens ?? 0), 0)
+  const outputTokens = measured.reduce((sum, usage) => sum + (usage.outputTokens ?? 0), 0)
+  const totalTokens = inputTokens + outputTokens
+  const tokenLimit = mission.budget?.tokenLimit ?? null
+  mission.tokenUsage = { available: true, source: 'state.db:sessions', measuredAt: Math.max(...measured.map((usage) => usage.measuredAt)), inputTokens, outputTokens, totalTokens, overBudget: tokenLimit === null ? false : totalTokens > tokenLimit }
 }
 
 export function listSwarmMissions(limit = 20): Array<SwarmMission> {
@@ -198,6 +253,7 @@ export function createOrUpdateMission(input: {
   initiatedBy?: string | null
   returnSessionKey?: string | null
   budget?: SwarmMissionBudget | null
+  workMode?: 'direct' | 'governed' | 'autonomous'
   assignments: Array<{ workerId: string; task: string; rationale?: string | null; dependsOn?: Array<string>; reviewRequired?: boolean }>
 }): CreateOrUpdateMissionResult {
   const store = readStore()
@@ -214,6 +270,8 @@ export function createOrUpdateMission(input: {
       initiatedBy: input.initiatedBy ?? null,
       returnSessionKey: input.returnSessionKey ?? null,
       budget: input.budget ?? null,
+      workMode: input.workMode ?? 'direct',
+      tokenUsage: unavailableTokenUsage(createdAt),
       state: 'planning',
       createdAt,
       updatedAt: createdAt,
@@ -238,6 +296,9 @@ export function createOrUpdateMission(input: {
   if (input.initiatedBy !== undefined) mission.initiatedBy = input.initiatedBy
   if (input.returnSessionKey !== undefined) mission.returnSessionKey = input.returnSessionKey
   if (input.budget !== undefined) mission.budget = input.budget
+  if (mission.budget) mission.budget.mode = 'advisory'
+  if (input.workMode !== undefined) mission.workMode = input.workMode
+  mission.workMode ??= 'direct'
   for (const assignment of input.assignments) {
     const existing = mission.assignments.find((item) => item.workerId === assignment.workerId && item.task === assignment.task)
     if (existing) continue
@@ -255,6 +316,8 @@ export function createOrUpdateMission(input: {
       reviewedAt: null,
       reviewedBy: null,
       checkpoint: null,
+      tokenBaseline: null,
+      tokenUsage: null,
     })
   }
   mission.updatedAt = now()
@@ -279,6 +342,7 @@ export function markMissionAssignmentDispatched(input: {
   if (isTerminalAssignment(assignment)) return mission
   assignment.state = 'dispatched'
   assignment.dispatchedAt = now()
+  assignment.tokenBaseline = readWorkerTokenUsage(getSwarmProfilePath(input.workerId))
   mission.events.push(event('assignment_dispatched', `Dispatched ${assignment.id} to ${input.workerId}`, {
     workerId: input.workerId,
     assignmentId: assignment.id,
@@ -328,12 +392,15 @@ export function recordMissionCheckpoint(input: {
       : input.checkpoint.stateLabel === 'IN_PROGRESS'
         ? 'dispatched'
         : 'checkpointed'
+  measureAssignmentTokenUsage(assignment, mission.budget?.tokenLimit ?? null)
+  aggregateMissionTokenUsage(mission)
   const report = reportFromCheckpoint({
     missionId: mission.id,
     assignmentId: assignment.id,
     workerId: input.workerId,
     checkpoint: input.checkpoint,
     source: input.source,
+    tokenUsage: assignment.tokenUsage,
   })
   mission.events.push(event('checkpoint', `${input.workerId} checkpointed: ${input.checkpoint.stateLabel}`, {
     workerId: input.workerId,
@@ -385,12 +452,15 @@ export function recordMissionAssignmentBlocked(input: {
   assignment.state = 'blocked'
   assignment.completedAt = blockedAt
   assignment.checkpoint = checkpoint
+  measureAssignmentTokenUsage(assignment, mission.budget?.tokenLimit ?? null)
+  aggregateMissionTokenUsage(mission)
   const report = reportFromCheckpoint({
     missionId: mission.id,
     assignmentId: assignment.id,
     workerId: input.workerId,
     checkpoint,
     source: input.source,
+    tokenUsage: assignment.tokenUsage,
   })
   if (changed) {
     mission.events.push(event('blocked', `${input.workerId} blocked: ${reason}`, {
@@ -464,6 +534,7 @@ export function cancelSwarmAssignment(input: {
   if (!assignment) return null
   if (assignment.state === 'cancelled') return { mission, assignment, changed: false }
   const cancelledAt = now()
+  measureAssignmentTokenUsage(assignment, mission.budget?.tokenLimit ?? null)
   assignment.state = 'cancelled'
   assignment.completedAt = cancelledAt
   assignment.reviewedAt = cancelledAt
@@ -478,6 +549,7 @@ export function cancelSwarmAssignment(input: {
   }))
   mission.updatedAt = cancelledAt
   mission.state = deriveMissionState(mission.assignments)
+  aggregateMissionTokenUsage(mission)
   writeStore(store)
   return { mission, assignment, changed: true }
 }
@@ -495,6 +567,7 @@ export function cancelSwarmMission(input: {
   const cancelledAssignmentIds: Array<string> = []
   for (const assignment of mission.assignments) {
     if (isTerminalAssignment(assignment)) continue
+    measureAssignmentTokenUsage(assignment, mission.budget?.tokenLimit ?? null)
     assignment.state = 'cancelled'
     assignment.completedAt = cancelledAt
     assignment.reviewedAt = cancelledAt
@@ -503,6 +576,7 @@ export function cancelSwarmMission(input: {
   }
   mission.state = 'cancelled'
   mission.updatedAt = cancelledAt
+  aggregateMissionTokenUsage(mission)
   mission.events.push(event('mission_cancelled', `Cancelled mission${input.reason ? `: ${input.reason}` : ''}`, {
     data: {
       actor: input.actor?.trim() || 'system-cancel',

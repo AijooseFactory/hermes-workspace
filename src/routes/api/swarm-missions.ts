@@ -3,6 +3,7 @@ import { json } from '@tanstack/react-start'
 import { isAuthenticated } from '../../server/auth-middleware'
 import { SWARM_MISSIONS_PATH, cancelSwarmAssignment, cancelSwarmMission, getSwarmMission, listSwarmMissions, listSwarmReports } from '../../server/swarm-missions'
 import { resetSwarmWorkerRuntime } from '../../server/swarm-runtime-reset'
+import { publishSwarmCancellationNotification } from '../../server/swarm-notifications'
 
 type CancelPostBody = {
   action?: unknown
@@ -73,6 +74,13 @@ export const Route = createFileRoute('/api/swarm-missions')({
         const runtimeResets = body.resetWorkers !== false
           ? Array.from(workerIds).map((id) => resetSwarmWorkerRuntime(id, { actor, reason }))
           : []
+
+        publishSwarmCancellationNotification({
+          missionId,
+          assignmentId: 'assignment' in result ? result.assignment.id : null,
+          sessionKey: result.mission.returnSessionKey,
+          reason,
+        })
 
         return json({
           ok: true,

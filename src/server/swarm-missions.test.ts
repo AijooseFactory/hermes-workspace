@@ -1,13 +1,16 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 let tempRoot: string
+const originalHermesHome = process.env.HERMES_HOME
 
 async function loadModule() {
   vi.resetModules()
   tempRoot = mkdtempSync(join(tmpdir(), 'swarm-missions-test-'))
+  process.env.HERMES_HOME = tempRoot
   vi.doMock('./swarm-environment', () => ({
     SWARM_CANONICAL_REPO: tempRoot,
   }))
@@ -20,6 +23,8 @@ describe('swarm-missions', () => {
   })
 
   afterEach(() => {
+    if (originalHermesHome === undefined) delete process.env.HERMES_HOME
+    else process.env.HERMES_HOME = originalHermesHome
     vi.resetModules()
     vi.doUnmock('./swarm-environment')
     try { rmSync(tempRoot, { recursive: true, force: true }) } catch { /* ignore */ }
@@ -59,6 +64,33 @@ describe('swarm-missions', () => {
     const persisted = mod.getSwarmMission(mission.id)
     expect(persisted?.authority?.id).toBe('AIJ-99')
     expect(persisted?.assignments).toHaveLength(1)
+  })
+
+  it('defaults to direct work with advisory budgets and accepts project authority', async () => {
+    const mod = await loadModule()
+    const mission = mod.createOrUpdateMission({ missionId: 'mission-control-defaults', title: 'Control defaults', authority: { system: 'project', id: 'AIJ', url: 'project://AIJ' }, budget: { tokenLimit: 50, stopCondition: null }, assignments: [{ workerId: 'builder', task: 'Continue autonomously' }] })
+    expect(mission.workMode).toBe('direct')
+    expect(mission.authority?.system).toBe('project')
+    expect(mission.budget).toMatchObject({ mode: 'advisory', tokenLimit: 50 })
+  })
+
+  it('captures per-assignment and aggregate token deltas without blocking over-budget work', async () => {
+    const mod = await loadModule()
+    const profilePath = join(tempRoot, 'profiles', 'builder')
+    mkdirSync(profilePath, { recursive: true })
+    const dbPath = join(profilePath, 'state.db')
+    execFileSync('python3', ['-c', `import sqlite3, sys
+con = sqlite3.connect(sys.argv[1]); con.execute('create table sessions (id text primary key, input_tokens integer, output_tokens integer)'); con.execute('insert into sessions values ("session-1", 100, 20)'); con.commit(); con.close()`, dbPath])
+    const mission = mod.createOrUpdateMission({ missionId: 'mission-token-delta', title: 'Token delta', budget: { tokenLimit: 50, stopCondition: null }, assignments: [{ workerId: 'builder', task: 'Measured task', reviewRequired: false }] })
+    mod.markMissionAssignmentDispatched({ missionId: mission.id, workerId: 'builder', task: 'Measured task' })
+    execFileSync('python3', ['-c', `import sqlite3, sys
+con = sqlite3.connect(sys.argv[1]); con.execute('update sessions set input_tokens = 180, output_tokens = 40'); con.commit(); con.close()`, dbPath])
+    const updated = mod.recordMissionCheckpoint({ missionId: mission.id, assignmentId: mission.assignments[0]?.id, workerId: 'builder', checkpoint: { stateLabel: 'DONE', runtimeState: 'idle', checkpointStatus: 'done', filesChanged: 'none', commandsRun: 'pnpm test', result: 'Completed despite advisory limit', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: Completed despite advisory limit' } })
+
+    expect(updated?.state).toBe('complete')
+    expect(updated?.assignments[0]?.tokenUsage).toMatchObject({ source: 'state.db:sessions', inputTokens: 80, outputTokens: 20, totalTokens: 100, overBudget: true })
+    expect(updated?.tokenUsage).toMatchObject({ source: 'state.db:sessions', inputTokens: 80, outputTokens: 20, totalTokens: 100, overBudget: true })
+    expect(mod.listSwarmReports({ missionId: mission.id })[0]?.tokenUsage).toMatchObject({ source: 'state.db:sessions', measuredAt: expect.any(Number), totalTokens: 100, overBudget: true })
   })
 
   it('records checkpoints by assignment id, stores report metadata, and exposes flattened reports', async () => {
