@@ -60,6 +60,7 @@ type DispatchRequest = {
   returnSessionKey?: unknown
   tokenLimit?: unknown
   stopCondition?: unknown
+  workMode?: unknown
   direct?: unknown
   notifySessionKey?: unknown
 }
@@ -517,16 +518,19 @@ export function dispatchBlockReason(result: Pick<WorkerResult, 'ok' | 'error' | 
   return null
 }
 
-function recordDispatchBlock(workerId: string, assignment: AssignmentRequest, result: WorkerResult, options?: { missionId?: string | null }): void {
+function recordDispatchBlock(workerId: string, assignment: AssignmentRequest, result: WorkerResult, options?: { missionId?: string | null; notifySessionKey?: string | null }): void {
   const reason = dispatchBlockReason(result)
   if (!reason) return
-  recordMissionAssignmentBlocked({
+  const blocked = recordMissionAssignmentBlocked({
     missionId: options?.missionId,
     assignmentId: assignment.assignmentId ?? null,
     workerId,
     reason,
     source: 'swarm-dispatch',
   })
+  if (blocked?.changed && blocked.assignment.checkpoint) {
+    publishSwarmCheckpointNotification({ workerId, missionId: options?.missionId, assignmentId: blocked.assignment.id, checkpoint: blocked.assignment.checkpoint, notifySessionKey: options?.notifySessionKey })
+  }
   writeRuntimePatch(workerId, {
     state: 'blocked',
     phase: 'blocked',
@@ -1098,9 +1102,11 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   const waitForCheckpoint = !(body.waitForCheckpoint === false && body.allowAsync === true)
   const pollRaw = typeof body.checkpointPollSeconds === 'number' ? body.checkpointPollSeconds : 90
   const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
-  const notifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim() ? body.notifySessionKey.trim() : 'main'
+  const requestedNotifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim()
+    ? body.notifySessionKey.trim()
+    : null
 
-  const authoritySystem = body.authoritySystem === 'desktop' || body.authoritySystem === 'github' || body.authoritySystem === 'paperclip'
+  const authoritySystem = body.authoritySystem === 'desktop' || body.authoritySystem === 'github' || body.authoritySystem === 'paperclip' || body.authoritySystem === 'project'
     ? body.authoritySystem
     : null
   const authorityId = typeof body.authorityId === 'string' ? body.authorityId.trim() : ''
@@ -1121,6 +1127,7 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
     ? Math.floor(body.tokenLimit)
     : null
   const stopCondition = typeof body.stopCondition === 'string' && body.stopCondition.trim() ? body.stopCondition.trim() : null
+  const workMode = body.workMode === 'direct' || body.workMode === 'governed' || body.workMode === 'autonomous' ? body.workMode : undefined
 
   const requestedMissionId = typeof body.missionId === 'string' ? body.missionId.trim() : ''
   const hasExplicitMissionTitle = typeof body.missionTitle === 'string' && body.missionTitle.trim()
@@ -1135,8 +1142,13 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
     initiatedBy,
     returnSessionKey,
     budget: tokenLimit || stopCondition ? { tokenLimit, stopCondition } : undefined,
+    workMode,
     assignments,
   })
+  const notifySessionKey = requestedNotifySessionKey
+    ?? returnSessionKey
+    ?? mission.returnSessionKey
+    ?? 'main'
   if (mission._created) {
     for (const workerId of new Set(assignments.map((a) => a.workerId))) {
       try {

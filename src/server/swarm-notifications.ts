@@ -1,5 +1,5 @@
-import { join } from 'node:path'
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import type { ParsedSwarmCheckpoint } from './swarm-checkpoints'
 import { getSwarmProfilePath } from './swarm-foundation'
@@ -94,7 +94,10 @@ function readRuntime(runtimePath: string): Record<string, unknown> {
 }
 
 function writeRuntime(runtimePath: string, value: Record<string, unknown>): void {
-  writeFileSync(runtimePath, JSON.stringify(value, null, 2) + '\n')
+  mkdirSync(dirname(runtimePath), { recursive: true })
+  const tmp = `${runtimePath}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n')
+  renameSync(tmp, runtimePath)
 }
 
 function checkpointSummary(checkpoint: ParsedSwarmCheckpoint): string {
@@ -137,10 +140,8 @@ export function publishSwarmActionPrompt(input: {
   return { published: true, sessionKey }
 }
 
-function shouldEscalateToMain(stateLabel: string): boolean {
-  // Only NEEDS_INPUT escalates to the main agent directly.
-  // BLOCKED/HANDOFF/DONE go to the orchestrator first; orchestrator escalates if needed.
-  return stateLabel === 'NEEDS_INPUT'
+function isTerminalCheckpoint(stateLabel: string): boolean {
+  return stateLabel === 'DONE' || stateLabel === 'BLOCKED' || stateLabel === 'HANDOFF' || stateLabel === 'NEEDS_INPUT'
 }
 
 export function publishSwarmCheckpointNotification(input: {
@@ -149,12 +150,15 @@ export function publishSwarmCheckpointNotification(input: {
   missionId?: string | null
   assignmentId?: string | null
   notifySessionKey?: string | null
-}): { published: boolean; sessionKey: string; route: 'orchestrator' | 'main' | 'noop'; orchestrator?: { sent: boolean; session: string; error?: string; skippedSelf?: boolean } } {
+}): { published: boolean; sessionKey: string; route: 'orchestrator' | 'desktop' | 'noop'; orchestrator?: { sent: boolean; session: string; error?: string; skippedSelf?: boolean } } {
   const profilePath = getSwarmProfilePath(input.workerId)
   const runtimePath = join(profilePath, 'runtime.json')
   const current = readRuntime(runtimePath)
   const currentRaw = typeof current.lastNotifiedCheckpointRaw === 'string' ? current.lastNotifiedCheckpointRaw : null
   const currentSig = typeof current.lastNotifiedCheckpointSignature === 'string' ? current.lastNotifiedCheckpointSignature : null
+  const notifiedSignatures = Array.isArray(current.notifiedCheckpointSignatures)
+    ? current.notifiedCheckpointSignatures.filter((value): value is string => typeof value === 'string')
+    : []
   const checkpointRaw = input.checkpoint.raw?.trim() || ''
   const sessionKey = input.notifySessionKey?.trim() || (typeof current.notifySessionKey === 'string' && current.notifySessionKey.trim()) || MAIN_SESSION_KEY
 
@@ -162,6 +166,8 @@ export function publishSwarmCheckpointNotification(input: {
   // doesn't suppress a notification when raw text is empty/recycled but the semantic
   // state actually changed (e.g. worker went executing -> done with same scraped raw).
   const checkpointSignature = [
+    input.missionId ?? '',
+    input.assignmentId ?? '',
     input.checkpoint.stateLabel,
     input.checkpoint.checkpointStatus ?? '',
     input.checkpoint.result ?? '',
@@ -170,7 +176,7 @@ export function publishSwarmCheckpointNotification(input: {
     checkpointRaw,
   ].join('|')
 
-  if (currentSig && currentSig === checkpointSignature) {
+  if ((currentSig && currentSig === checkpointSignature) || notifiedSignatures.includes(checkpointSignature)) {
     return { published: false, sessionKey, route: 'noop' }
   }
   // Backwards-compat: if no signature was ever stored but raw matches AND nothing else
@@ -194,11 +200,12 @@ export function publishSwarmCheckpointNotification(input: {
     missionId: input.missionId,
   })
 
-  // 2. Escalate to the main agent only on NEEDS_INPUT, or when the orchestrator is unreachable.
-  const mustEscalate = shouldEscalateToMain(input.checkpoint.stateLabel) || (!orchestratorResult.sent && !orchestratorResult.skippedSelf)
-  let publishedToMain = false
+  // Terminal evidence is always visible in the originating Desktop session.
+  // IN_PROGRESS remains orchestrator-only unless that route is unavailable.
+  const mustPublishToDesktop = isTerminalCheckpoint(input.checkpoint.stateLabel) || (!orchestratorResult.sent && !orchestratorResult.skippedSelf)
+  let publishedToDesktop = false
 
-  if (mustEscalate) {
+  if (mustPublishToDesktop) {
     publishChatEvent('message', {
       type: 'message',
       sessionKey,
@@ -213,26 +220,46 @@ export function publishSwarmCheckpointNotification(input: {
           missionId: input.missionId ?? null,
           assignmentId: input.assignmentId ?? null,
           checkpointState: input.checkpoint.stateLabel,
-          escalationReason: shouldEscalateToMain(input.checkpoint.stateLabel)
-            ? `state ${input.checkpoint.stateLabel} requires main-agent input`
+          escalationReason: isTerminalCheckpoint(input.checkpoint.stateLabel)
+            ? `terminal state ${input.checkpoint.stateLabel} published to originating Desktop session`
             : `orchestrator unreachable: ${orchestratorResult.error ?? 'unknown'}`,
         },
       },
     })
     publishChatStatus(sessionKey, text)
-    publishedToMain = true
+    publishedToDesktop = true
   }
 
+  const latest = readRuntime(runtimePath)
+  const latestSignatures = Array.isArray(latest.notifiedCheckpointSignatures)
+    ? latest.notifiedCheckpointSignatures.filter((value): value is string => typeof value === 'string')
+    : notifiedSignatures
   writeRuntime(runtimePath, {
-    ...current,
+    ...latest,
     notifySessionKey: sessionKey,
     lastNotifiedCheckpointRaw: checkpointRaw || null,
     lastNotifiedCheckpointSignature: checkpointSignature,
+    notifiedCheckpointSignatures: [...new Set([...latestSignatures, checkpointSignature])].slice(-50),
     lastNotifiedAt: new Date().toISOString(),
-    lastCheckpointRoute: publishedToMain ? 'main' : 'orchestrator',
+    lastCheckpointRoute: publishedToDesktop ? 'desktop' : 'orchestrator',
     lastOrchestratorSendOk: orchestratorResult.sent,
   })
 
-  const route: 'orchestrator' | 'main' | 'noop' = publishedToMain ? 'main' : (orchestratorResult.sent || orchestratorResult.skippedSelf ? 'orchestrator' : 'noop')
-  return { published: publishedToMain || orchestratorResult.sent, sessionKey, route, orchestrator: orchestratorResult }
+  const route: 'orchestrator' | 'desktop' | 'noop' = publishedToDesktop ? 'desktop' : (orchestratorResult.sent || orchestratorResult.skippedSelf ? 'orchestrator' : 'noop')
+  return { published: publishedToDesktop || orchestratorResult.sent, sessionKey, route, orchestrator: orchestratorResult }
+}
+
+export function publishSwarmCancellationNotification(input: {
+  missionId: string
+  sessionKey?: string | null
+  reason: string
+  assignmentId?: string | null
+}): { published: boolean; sessionKey: string } {
+  return publishSwarmActionPrompt({
+    sessionKey: input.sessionKey,
+    missionId: input.missionId,
+    title: input.assignmentId ? 'Assignment cancelled' : 'Mission cancelled',
+    text: input.reason,
+    details: { source: 'swarm-cancellation', assignmentId: input.assignmentId ?? null },
+  })
 }

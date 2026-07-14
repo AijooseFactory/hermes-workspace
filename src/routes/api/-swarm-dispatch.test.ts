@@ -45,6 +45,19 @@ afterEach(() => {
 })
 
 describe('dispatchSwarmAssignments', () => {
+  it('accepts autonomous work mode and project authority while keeping token limits advisory', async () => {
+    process.env.HERMES_HOME = join(tempRoot, 'hermes')
+    const result = await dispatchSwarmAssignments({
+      missionId: 'mission-autonomous-controls', missionTitle: 'Autonomous controls', workMode: 'autonomous',
+      authoritySystem: 'project', authorityId: 'AIJ', authorityUrl: 'project://AIJ',
+      returnSessionKey: 'desktop-session-42', tokenLimit: 10,
+      assignments: [{ workerId: 'missing-test-worker', task: 'Continue without a hard token gate' }],
+      waitForCheckpoint: false, allowAsync: true,
+    })
+    expect(result.notifySessionKey).toBe('desktop-session-42')
+    expect(result.mission).toMatchObject({ workMode: 'autonomous', authority: { system: 'project', id: 'AIJ' }, budget: { mode: 'advisory', tokenLimit: 10 } })
+  })
+
   it('preserves mission initiator metadata when an update omits both fields', async () => {
     process.env.HERMES_HOME = join(tempRoot, 'hermes')
     const existingMission = createOrUpdateMission({
@@ -66,6 +79,7 @@ describe('dispatchSwarmAssignments', () => {
       initiatedBy: 'hermes-desktop',
       returnSessionKey: 'desktop-session-1',
     })
+    expect(result.notifySessionKey).toBe('desktop-session-1')
   })
 })
 

@@ -44,6 +44,52 @@ afterEach(() => {
 })
 
 describe('swarm-notifications', () => {
+  it.each(['DONE', 'BLOCKED', 'HANDOFF', 'NEEDS_INPUT'] as const)('publishes %s evidence to Desktop and the orchestrator once', async (stateLabel) => {
+    const { mod, publishChatEvent } = await loadModule()
+    mkdirSync(join(tempRoot, 'builder'), { recursive: true })
+    const checkpoint = {
+      stateLabel,
+      runtimeState: stateLabel === 'BLOCKED' ? 'blocked' as const : stateLabel === 'NEEDS_INPUT' ? 'waiting' as const : 'idle' as const,
+      checkpointStatus: stateLabel === 'BLOCKED' ? 'blocked' as const : stateLabel === 'NEEDS_INPUT' ? 'needs_input' as const : stateLabel === 'HANDOFF' ? 'handoff' as const : 'done' as const,
+      filesChanged: 'src/example.ts', commandsRun: 'pnpm test', result: 'Focused terminal evidence', blocker: stateLabel === 'BLOCKED' ? 'Exact blocker' : null, nextAction: 'Review evidence', raw: `STATE: ${stateLabel}\nRESULT: Focused terminal evidence`,
+    }
+    const first = mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'assignment-1', checkpoint, notifySessionKey: 'desktop-origin' })
+    const duplicate = mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'assignment-1', checkpoint, notifySessionKey: 'desktop-origin' })
+    expect(first).toMatchObject({ published: true, sessionKey: 'desktop-origin', route: 'desktop' })
+    expect(first.orchestrator).toMatchObject({ sent: true, session: 'swarm-orchestrator' })
+    expect(duplicate.route).toBe('noop')
+    expect(publishChatEvent).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps IN_PROGRESS orchestrator-only', async () => {
+    const { mod, publishChatEvent } = await loadModule()
+    mkdirSync(join(tempRoot, 'builder'), { recursive: true })
+    const result = mod.publishSwarmCheckpointNotification({ workerId: 'builder', notifySessionKey: 'desktop-origin', checkpoint: { stateLabel: 'IN_PROGRESS', runtimeState: 'executing', checkpointStatus: 'in_progress', filesChanged: 'none', commandsRun: 'pnpm test', result: 'still working', blocker: null, nextAction: 'continue', raw: 'STATE: IN_PROGRESS\nRESULT: still working' } })
+    expect(result.route).toBe('orchestrator')
+    expect(publishChatEvent).not.toHaveBeenCalled()
+  })
+
+  it('does not dedupe identical evidence from different assignments', async () => {
+    const { mod, publishChatEvent } = await loadModule()
+    mkdirSync(join(tempRoot, 'builder'), { recursive: true })
+    const checkpoint = { stateLabel: 'DONE' as const, runtimeState: 'idle' as const, checkpointStatus: 'done' as const, filesChanged: 'none', commandsRun: 'pnpm test', result: 'same evidence', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: same evidence' }
+    mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'one', checkpoint, notifySessionKey: 'desktop' })
+    const second = mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'two', checkpoint, notifySessionKey: 'desktop' })
+    expect(second.route).toBe('desktop')
+    expect(publishChatEvent).toHaveBeenCalledTimes(4)
+  })
+
+  it('deduplicates an assignment checkpoint after another assignment reports', async () => {
+    const { mod, publishChatEvent } = await loadModule()
+    mkdirSync(join(tempRoot, 'builder'), { recursive: true })
+    const checkpoint = { stateLabel: 'DONE' as const, runtimeState: 'idle' as const, checkpointStatus: 'done' as const, filesChanged: 'none', commandsRun: 'pnpm test', result: 'same evidence', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: same evidence' }
+    mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'one', checkpoint, notifySessionKey: 'desktop' })
+    mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'two', checkpoint, notifySessionKey: 'desktop' })
+    const replay = mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'one', checkpoint, notifySessionKey: 'desktop' })
+    expect(replay.route).toBe('noop')
+    expect(publishChatEvent).toHaveBeenCalledTimes(4)
+  })
+
   it('publishes checkpoint notifications once per unique raw and persists dedupe state', async () => {
     const { mod, publishChatEvent } = await loadModule()
     const checkpoint = {
@@ -75,13 +121,12 @@ describe('swarm-notifications', () => {
       notifySessionKey: 'qa-main',
     })
 
-    // DONE checkpoints route to the orchestrator tmux session, not main.
-    expect(first).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'orchestrator' })
+    // Terminal checkpoints publish to Desktop while still routing to the orchestrator.
+    expect(first).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'desktop' })
     expect(first.orchestrator).toMatchObject({ sent: true, session: 'swarm-orchestrator' })
     // Same raw is deduped on the second call.
     expect(second).toMatchObject({ published: false, sessionKey: 'qa-main', route: 'noop' })
-    // No chat event was published — DONE goes to orchestrator only.
-    expect(publishChatEvent).not.toHaveBeenCalled()
+    expect(publishChatEvent).toHaveBeenCalledTimes(2)
     // tmux send-keys ran for orchestrator routing on the first call.
     const sendKeyCalls = execFileSyncCalls.filter((c) => c.args[0] === 'send-keys')
     expect(sendKeyCalls.length).toBeGreaterThanOrEqual(2) // -l <text>, then Enter
@@ -91,7 +136,7 @@ describe('swarm-notifications', () => {
     expect(JSON.parse(readFileSync(runtimePath, 'utf8'))).toMatchObject({
       notifySessionKey: 'qa-main',
       lastNotifiedCheckpointRaw: checkpoint.raw,
-      lastCheckpointRoute: 'orchestrator',
+      lastCheckpointRoute: 'desktop',
       lastOrchestratorSendOk: true,
     })
   })
@@ -158,7 +203,7 @@ describe('swarm-notifications', () => {
       notifySessionKey: 'qa-main',
     })
 
-    expect(result).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'main' })
+    expect(result).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'desktop' })
     expect(result.orchestrator).toMatchObject({ sent: true, session: 'swarm-orchestrator' })
     // Both the orchestrator AND main were notified.
     expect(publishChatEvent).toHaveBeenCalledTimes(2)
@@ -200,7 +245,7 @@ describe('swarm-notifications', () => {
       notifySessionKey: 'qa-main',
     })
 
-    expect(result).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'main' })
+    expect(result).toMatchObject({ published: true, sessionKey: 'qa-main', route: 'desktop' })
     expect(result.orchestrator).toMatchObject({ sent: false, session: 'swarm-orchestrator' })
     expect(publishChatEvent).toHaveBeenCalled()
   })
