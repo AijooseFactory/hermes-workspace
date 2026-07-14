@@ -520,7 +520,7 @@ export function buildSwarmDispatchMetadata(input: {
 }): SwarmDispatchMetadata {
   return {
     preferredDelivery: input.tmuxAttachable ? 'tmux' : 'oneshot',
-    supportsLiveDispatch: input.tmuxAttachable || input.wrapperExists,
+    supportsLiveDispatch: input.tmuxAttachable,
     supportsOneShotDispatch: true,
     lastDispatchAt: input.runtime.lastDispatchAt,
     lastDispatchMode: input.runtime.lastDispatchMode,

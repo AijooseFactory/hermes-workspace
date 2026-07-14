@@ -77,6 +77,8 @@ type WorkerResult = {
   checkpointStatus?: 'checkpointed' | 'timeout' | 'not-requested'
 }
 
+type AcceptedWorkerResult = { workerId: string; accepted: true; status: 'background' }
+
 type RuntimeCheckpointSnapshot = {
   checkpointStatus: 'none' | 'in_progress' | 'done' | 'blocked' | 'handoff' | 'needs_input'
   state: string | null
@@ -93,6 +95,7 @@ const MAX_PROMPT_CHARS = 32_000
 const MAX_OUTPUT_CHARS = 200_000
 const DEFAULT_TIMEOUT_S = 240
 const MAX_TIMEOUT_S = 600
+const backgroundDispatches = new Set<Promise<void>>()
 
 function getProfilesDir(): string {
   const base = process.env.HERMES_HOME ?? process.env.CLAUDE_HOME
@@ -584,17 +587,33 @@ async function waitForFreshCheckpoint(
     const runtimeSnapshot = readRuntimeCheckpointSnapshot(profilePath)
     if (runtimeSnapshotIsFresh(runtimeSnapshot, baselineRuntimeSignature, dispatchedAt)) {
       const runtimeCheckpoint = checkpointFromRuntimeSnapshot(runtimeSnapshot)
-      if (runtimeCheckpoint && runtimeCheckpoint.raw !== previousRaw) return runtimeCheckpoint
+      if (runtimeCheckpoint && runtimeCheckpoint.checkpointStatus !== 'in_progress' && runtimeCheckpoint.raw !== previousRaw) return runtimeCheckpoint
     }
 
     const chat = readWorkerMessages(profilePath, 50)
     if (chat.ok) {
       const checkpoint = newestCheckpointFromMessages(chat.messages)
-      if (checkpoint && checkpoint.raw !== previousRaw) return checkpoint
+      if (checkpoint && checkpoint.checkpointStatus !== 'in_progress' && checkpoint.raw !== previousRaw) return checkpoint
     }
     await sleep(2_000)
   }
   return null
+}
+
+function recordFreshCheckpoint(workerId: string, assignment: AssignmentRequest, checkpoint: ParsedSwarmCheckpoint, options?: { missionId?: string | null; notifySessionKey?: string | null }): boolean {
+  const existing = options?.missionId ? getSwarmMission(options.missionId)?.assignments.find((item) => item.id === assignment.assignmentId) : null
+  if (existing?.checkpoint?.raw === checkpoint.raw) return false
+  markCheckpointResult(workerId, checkpoint, options?.notifySessionKey ?? 'main')
+  const updatedMission = recordMissionCheckpoint({ missionId: options?.missionId, assignmentId: assignment.assignmentId ?? null, workerId, checkpoint, source: 'swarm-dispatch' })
+  if (updatedMission?._ignoredReason) return false
+  if (updatedMission?._completed) {
+    try {
+      for (const wId of new Set(updatedMission.assignments.map((item) => item.workerId))) appendSwarmMemoryEvent({ workerId: wId, missionId: updatedMission.id, type: 'complete', title: updatedMission.title, summary: `Mission complete: ${updatedMission.title}` })
+    } catch { /* memory write best-effort */ }
+  }
+  appendSwarmMemoryEvent({ workerId, missionId: options?.missionId ?? null, assignmentId: assignment.assignmentId ?? null, type: 'checkpoint', summary: checkpoint.result ?? `Checkpoint ${checkpoint.stateLabel}`, checkpoint, event: { stateLabel: checkpoint.stateLabel, filesChanged: checkpoint.filesChanged, commandsRun: checkpoint.commandsRun, blocker: checkpoint.blocker, nextAction: checkpoint.nextAction } })
+  publishSwarmCheckpointNotification({ workerId, missionId: options?.missionId ?? null, assignmentId: assignment.assignmentId ?? null, checkpoint, notifySessionKey: options?.notifySessionKey ?? 'main' })
+  return true
 }
 
 function resolveWorkerCwd(workerId: string): string {
@@ -806,7 +825,8 @@ export function buildHermesChatQueryArgs(prompt: string): string[] {
 }
 
 function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: SwarmRosterWorker | undefined, options?: { waitForCheckpoint?: boolean; checkpointPollMs?: number; missionId?: string | null; notifySessionKey?: string | null }): Promise<WorkerResult> {
-  return new Promise(async (resolve) => {
+  return new Promise((resolve) => {
+    void (async () => {
     const workerId = assignment.workerId
     const prompt = buildWorkerPrompt({
       workerId,
@@ -860,49 +880,7 @@ function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: Swa
           options.checkpointPollMs ?? 90_000,
         )
         if (checkpoint) {
-          markCheckpointResult(workerId, checkpoint, options?.notifySessionKey ?? 'main')
-          const updatedMission = recordMissionCheckpoint({
-            missionId: options?.missionId,
-            assignmentId: assignment.assignmentId ?? null,
-            workerId,
-            checkpoint,
-            source: 'swarm-dispatch',
-          })
-          if (updatedMission?._completed) {
-            try {
-              for (const wId of new Set(updatedMission.assignments.map((a) => a.workerId))) {
-                appendSwarmMemoryEvent({
-                  workerId: wId,
-                  missionId: updatedMission.id,
-                  type: 'complete',
-                  title: updatedMission.title,
-                  summary: `Mission complete: ${updatedMission.title}`,
-                })
-              }
-            } catch { /* memory write best-effort */ }
-          }
-          appendSwarmMemoryEvent({
-            workerId,
-            missionId: options?.missionId ?? null,
-            assignmentId: assignment.assignmentId ?? null,
-            type: 'checkpoint',
-            summary: checkpoint.result ?? `Checkpoint ${checkpoint.stateLabel}`,
-            checkpoint,
-            event: {
-              stateLabel: checkpoint.stateLabel,
-              filesChanged: checkpoint.filesChanged,
-              commandsRun: checkpoint.commandsRun,
-              blocker: checkpoint.blocker,
-              nextAction: checkpoint.nextAction,
-            },
-          })
-          publishSwarmCheckpointNotification({
-            workerId,
-            missionId: options?.missionId ?? null,
-            assignmentId: assignment.assignmentId ?? null,
-            checkpoint,
-            notifySessionKey: options?.notifySessionKey ?? 'main',
-          })
+          recordFreshCheckpoint(workerId, assignment, checkpoint, options)
           liveResult.checkpoint = checkpoint
           liveResult.checkpointStatus = 'checkpointed'
           liveResult.output = `${liveResult.output}\nCheckpoint ${checkpoint.stateLabel}: ${checkpoint.result ?? 'no result'}`
@@ -990,39 +968,11 @@ function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: Swa
           exitCode: 0,
           delivery: 'oneshot',
         }
+        markDispatchResult(workerId, result)
         if (options?.waitForCheckpoint) {
           const checkpoint = parseSwarmCheckpoint(out)
-          if (checkpoint) {
-            markCheckpointResult(workerId, checkpoint, options?.notifySessionKey ?? 'main')
-            recordMissionCheckpoint({
-              missionId: options?.missionId,
-              assignmentId: assignment.assignmentId ?? null,
-              workerId,
-              checkpoint,
-              source: 'swarm-dispatch',
-            })
-            appendSwarmMemoryEvent({
-              workerId,
-              missionId: options?.missionId ?? null,
-              assignmentId: assignment.assignmentId ?? null,
-              type: 'checkpoint',
-              summary: checkpoint.result ?? `Checkpoint ${checkpoint.stateLabel}`,
-              checkpoint,
-              event: {
-                stateLabel: checkpoint.stateLabel,
-                filesChanged: checkpoint.filesChanged,
-                commandsRun: checkpoint.commandsRun,
-                blocker: checkpoint.blocker,
-                nextAction: checkpoint.nextAction,
-              },
-            })
-            publishSwarmCheckpointNotification({
-              workerId,
-              missionId: options?.missionId ?? null,
-              assignmentId: assignment.assignmentId ?? null,
-              checkpoint,
-              notifySessionKey: options?.notifySessionKey ?? 'main',
-            })
+          if (checkpoint && checkpoint.checkpointStatus !== 'in_progress') {
+            recordFreshCheckpoint(workerId, assignment, checkpoint, options)
             result.checkpoint = checkpoint
             result.checkpointStatus = 'checkpointed'
           } else {
@@ -1032,7 +982,6 @@ function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: Swa
         } else {
           result.checkpointStatus = 'not-requested'
         }
-        markDispatchResult(workerId, result)
         recordDispatchBlock(workerId, assignment, result, options)
         resolve(result)
       },
@@ -1050,6 +999,12 @@ function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: Swa
       }
       markDispatchResult(workerId, result)
       recordDispatchBlock(workerId, assignment, result, options)
+      resolve(result)
+    })
+    })().catch((error) => {
+      const result: WorkerResult = { workerId: assignment.workerId, ok: false, output: '', error: error instanceof Error ? error.message : String(error), durationMs: 0, exitCode: null }
+      markDispatchResult(assignment.workerId, result)
+      recordDispatchBlock(assignment.workerId, assignment, result, options)
       resolve(result)
     })
   })
@@ -1099,7 +1054,8 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   const timeoutRaw = typeof body.timeoutSeconds === 'number' ? body.timeoutSeconds : DEFAULT_TIMEOUT_S
   const timeoutSeconds = Math.max(10, Math.min(MAX_TIMEOUT_S, Math.floor(timeoutRaw)))
   const timeoutMs = timeoutSeconds * 1000
-  const waitForCheckpoint = !(body.waitForCheckpoint === false && body.allowAsync === true)
+  const allowAsync = body.waitForCheckpoint === false && body.allowAsync === true
+  const waitForCheckpoint = !allowAsync
   const pollRaw = typeof body.checkpointPollSeconds === 'number' ? body.checkpointPollSeconds : 90
   const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
   const requestedNotifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim()
@@ -1172,12 +1128,22 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
 
   const dispatchedAt = Date.now()
   const roster = rosterByWorkerId(assignments.map((assignment) => assignment.workerId))
-  const results = await Promise.all(assignments.map((assignment) => runWorker(
-    assignment,
-    timeoutMs,
-    roster.get(assignment.workerId),
-    { waitForCheckpoint, checkpointPollMs: checkpointPollSeconds * 1000, missionId: mission.id, notifySessionKey },
-  )))
+  let results: Array<WorkerResult | AcceptedWorkerResult>
+  if (allowAsync) {
+    results = assignments.map((assignment) => {
+      const background = runWorker(assignment, timeoutMs, roster.get(assignment.workerId), {
+        waitForCheckpoint: true, checkpointPollMs: checkpointPollSeconds * 1000, missionId: mission.id, notifySessionKey,
+      }).then(() => undefined)
+      backgroundDispatches.add(background)
+      void background.then(() => backgroundDispatches.delete(background))
+      return { workerId: assignment.workerId, accepted: true, status: 'background' }
+    })
+  } else {
+    results = await Promise.all(assignments.map((assignment) => runWorker(
+      assignment, timeoutMs, roster.get(assignment.workerId),
+      { waitForCheckpoint, checkpointPollMs: checkpointPollSeconds * 1000, missionId: mission.id, notifySessionKey },
+    )))
+  }
 
   const latestMission = getSwarmMission(mission.id) ?? mission
 

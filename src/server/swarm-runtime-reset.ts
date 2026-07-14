@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getProfilesDir } from './claude-paths'
 import { listSwarmWorkerIds } from './swarm-foundation'
@@ -10,7 +10,17 @@ export type SwarmRuntimeResetResult = {
 }
 
 export function listResettableSwarmWorkerIds(): Array<string> {
-  return listSwarmWorkerIds({ swarmOnly: true }).filter((workerId) => workerId !== 'workspace')
+  let profileIds: Array<string> = []
+  try {
+    profileIds = readdirSync(getProfilesDir()).filter((workerId) => {
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(workerId) || workerId === 'workspace') return false
+      const entry = lstatSync(join(getProfilesDir(), workerId))
+      return entry.isDirectory() && !entry.isSymbolicLink()
+    })
+  } catch { /* profile discovery is best-effort */ }
+  return Array.from(new Set([...listSwarmWorkerIds({ swarmOnly: true }), ...profileIds]))
+    .filter((workerId) => workerId !== 'workspace')
+    .sort()
 }
 
 export function resolveResetTargetWorkerIds(workerIds?: Array<string> | null): {

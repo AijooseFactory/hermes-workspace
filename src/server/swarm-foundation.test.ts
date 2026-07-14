@@ -123,6 +123,11 @@ describe('buildSwarmDispatchMetadata', () => {
       lastDispatchResult: 'delivered',
     })
   })
+
+  it('does not report live dispatch when tmux is unavailable', () => {
+    const runtime = normalizeSwarmRuntime('builder', {}, { workspaceRoot: '/tmp' })
+    expect(buildSwarmDispatchMetadata({ runtime, tmuxAttachable: false, wrapperExists: true }).supportsLiveDispatch).toBe(false)
+  })
 })
 
 describe('parseSwarmPluginManifest', () => {

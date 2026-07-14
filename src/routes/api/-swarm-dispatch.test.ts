@@ -1,7 +1,7 @@
-import { rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createOrUpdateMission } from '../../server/swarm-missions'
+import { createOrUpdateMission, getSwarmMission } from '../../server/swarm-missions'
 import {
   buildHermesChatQueryArgs,
   buildHermesTmuxLaunchCommand,
@@ -14,6 +14,8 @@ import {
 } from './swarm-dispatch'
 
 const tempRoot = vi.hoisted(() => `/tmp/swarm-dispatch-test-${process.pid}-${Date.now()}`)
+const execScenario = vi.hoisted(() => ({ mode: 'unavailable' as 'unavailable' | 'delayed-oneshot' | 'live' }))
+const publishCheckpoint = vi.hoisted(() => vi.fn())
 
 vi.mock('../../server/swarm-environment', () => ({
   SWARM_CANONICAL_REPO: tempRoot,
@@ -22,10 +24,16 @@ vi.mock('../../server/swarm-environment', () => ({
 vi.mock('node:child_process', () => ({
   execFile: vi.fn((...args: Array<unknown>) => {
     const callback = args.at(-1) as (error: Error, stdout: string, stderr: string) => void
-    queueMicrotask(() => callback(new Error('command unavailable in test'), '', ''))
+    const commandArgs = args[1] as Array<string>
+    if (execScenario.mode === 'delayed-oneshot' && commandArgs[0] === 'chat') {
+      setTimeout(() => callback(null as unknown as Error, 'STATE: DONE\nFILES_CHANGED: none\nCOMMANDS_RUN: test\nRESULT: delayed complete\nBLOCKER: none\nNEXT_ACTION: none', ''), 120)
+    } else if (execScenario.mode === 'live') queueMicrotask(() => callback(null as unknown as Error, '', ''))
+    else queueMicrotask(() => callback(new Error('command unavailable in test'), '', ''))
     return { stdin: { end: vi.fn() }, on: vi.fn() }
   }),
 }))
+
+vi.mock('../../server/swarm-notifications', () => ({ publishSwarmCheckpointNotification: publishCheckpoint }))
 
 vi.mock('../../server/swarm-memory', () => ({
   appendSwarmMemoryEvent: vi.fn(),
@@ -42,9 +50,43 @@ afterEach(() => {
   if (originalHermesHome === undefined) delete process.env.HERMES_HOME
   else process.env.HERMES_HOME = originalHermesHome
   rmSync(tempRoot, { recursive: true, force: true })
+  execScenario.mode = 'unavailable'
+  publishCheckpoint.mockClear()
 })
 
 describe('dispatchSwarmAssignments', () => {
+  it('returns before a delayed one-shot fallback and completes the mission in the background', async () => {
+    process.env.HERMES_HOME = join(tempRoot, 'hermes')
+    const workerId = 'async-fallback-worker'
+    mkdirSync(join(tempRoot, 'hermes', 'profiles', workerId), { recursive: true })
+    execScenario.mode = 'delayed-oneshot'
+    const startedAt = Date.now()
+    const result = await dispatchSwarmAssignments({ missionId: 'mission-async-fallback', returnSessionKey: 'desktop-return', assignments: [{ workerId, task: 'Finish later', reviewRequired: false }], waitForCheckpoint: false, allowAsync: true })
+    expect(Date.now() - startedAt).toBeLessThan(100)
+    expect(result.results[0]).toMatchObject({ workerId, accepted: true })
+    expect(getSwarmMission(result.missionId)?.state).not.toBe('complete')
+    await vi.waitFor(() => expect(getSwarmMission(result.missionId)?.state).toBe('complete'), { timeout: 1_000 })
+    expect(getSwarmMission(result.missionId)?.assignments[0]?.checkpoint?.result).toBe('delayed complete')
+    expect(publishCheckpoint).toHaveBeenCalledTimes(1)
+    expect(publishCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ notifySessionKey: 'desktop-return' }))
+  })
+
+  it('monitors a live async tmux dispatch after returning and records its terminal checkpoint once', async () => {
+    process.env.HERMES_HOME = join(tempRoot, 'hermes')
+    const workerId = 'live-worker'
+    const profilePath = join(tempRoot, 'hermes', 'profiles', workerId)
+    mkdirSync(profilePath, { recursive: true })
+    writeFileSync(join(profilePath, 'runtime.json'), '{}')
+    execScenario.mode = 'live'
+    const result = await dispatchSwarmAssignments({ missionId: 'mission-live-monitor', assignments: [{ workerId, task: 'Complete live', reviewRequired: false }], waitForCheckpoint: false, allowAsync: true, checkpointPollSeconds: 5 })
+    expect(result.results[0]).toMatchObject({ accepted: true })
+    expect(getSwarmMission(result.missionId)?.state).not.toBe('complete')
+    setTimeout(() => writeFileSync(join(profilePath, 'runtime.json'), JSON.stringify({ checkpointStatus: 'done', state: 'idle', lastResult: 'live complete', lastCheckIn: new Date().toISOString(), lastOutputAt: Date.now() })), 3_200)
+    await vi.waitFor(() => expect(getSwarmMission(result.missionId)?.state).toBe('complete'), { timeout: 7_000, interval: 100 })
+    expect(getSwarmMission(result.missionId)?.events.filter((event) => event.type === 'checkpoint')).toHaveLength(1)
+    expect(publishCheckpoint).toHaveBeenCalledTimes(1)
+  }, 8_000)
+
   it('accepts autonomous work mode and project authority while keeping token limits advisory', async () => {
     process.env.HERMES_HOME = join(tempRoot, 'hermes')
     const result = await dispatchSwarmAssignments({
