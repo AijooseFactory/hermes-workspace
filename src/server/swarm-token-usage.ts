@@ -12,9 +12,10 @@ export type SwarmTokenUsageSnapshot = {
   error?: string
 }
 
-const READ_USAGE_SCRIPT = `import json, sqlite3, sys
+const READ_USAGE_SCRIPT = `import json, pathlib, sqlite3, sys
 try:
-    con = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+    db_uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro'
+    con = sqlite3.connect(db_uri, uri=True)
     con.row_factory = sqlite3.Row
     columns = {row['name'] for row in con.execute('pragma table_info(sessions)').fetchall()}
     if 'input_tokens' not in columns or 'output_tokens' not in columns:

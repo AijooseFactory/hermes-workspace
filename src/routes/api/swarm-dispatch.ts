@@ -1102,9 +1102,9 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
   const waitForCheckpoint = !(body.waitForCheckpoint === false && body.allowAsync === true)
   const pollRaw = typeof body.checkpointPollSeconds === 'number' ? body.checkpointPollSeconds : 90
   const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
-  const notifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim()
+  const requestedNotifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim()
     ? body.notifySessionKey.trim()
-    : typeof body.returnSessionKey === 'string' && body.returnSessionKey.trim() ? body.returnSessionKey.trim() : 'main'
+    : null
 
   const authoritySystem = body.authoritySystem === 'desktop' || body.authoritySystem === 'github' || body.authoritySystem === 'paperclip' || body.authoritySystem === 'project'
     ? body.authoritySystem
@@ -1145,6 +1145,10 @@ export async function dispatchSwarmAssignments(body: DispatchRequest) {
     workMode,
     assignments,
   })
+  const notifySessionKey = requestedNotifySessionKey
+    ?? returnSessionKey
+    ?? mission.returnSessionKey
+    ?? 'main'
   if (mission._created) {
     for (const workerId of new Set(assignments.map((a) => a.workerId))) {
       try {

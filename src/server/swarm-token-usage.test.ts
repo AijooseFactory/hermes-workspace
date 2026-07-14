@@ -52,4 +52,18 @@ describe('readWorkerTokenUsage', () => {
       rmSync(profilePath, { recursive: true, force: true })
     }
   })
+
+  it('reads paths containing URI-reserved characters without opening another database', () => {
+    const root = mkdtempSync(join(tmpdir(), 'swarm-token-path-'))
+    const profilePath = join(root, 'profile?#name')
+    try {
+      createStateDb(profilePath)
+      expect(readWorkerTokenUsage(profilePath)).toMatchObject({
+        available: true,
+        totalTokens: 175,
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

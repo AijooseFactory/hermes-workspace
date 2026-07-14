@@ -372,11 +372,10 @@ export function recordMissionCheckpoint(input: {
   const mission = store.missions.find((item) => item.id === input.missionId)
   if (!mission) return null
   if (mission.state === 'cancelled') return Object.assign(mission, { _ignoredReason: 'mission cancelled' })
-  const assignment = (input.assignmentId
-    ? mission.assignments.find((item) => item.id === input.assignmentId)
-    : null)
-    ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId && item.state !== 'done')
-    ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId)
+  const assignment = input.assignmentId
+    ? mission.assignments.find((item) => item.id === input.assignmentId && item.workerId === input.workerId)
+    : [...mission.assignments].reverse().find((item) => item.workerId === input.workerId && item.state !== 'done')
+      ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId)
   if (!assignment) return null
   if (assignment.state === 'cancelled') return Object.assign(mission, { _ignoredReason: 'assignment cancelled' })
   if (assignment.state === 'done') return Object.assign(mission, { _ignoredReason: 'assignment done' })
@@ -427,11 +426,10 @@ export function recordMissionAssignmentBlocked(input: {
   const mission = store.missions.find((item) => item.id === input.missionId)
   if (!mission) return null
   if (mission.state === 'cancelled' || mission.state === 'complete') return null
-  const assignment = (input.assignmentId
-    ? mission.assignments.find((item) => item.id === input.assignmentId)
-    : null)
-    ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId && !isTerminalAssignment(item))
-    ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId)
+  const assignment = input.assignmentId
+    ? mission.assignments.find((item) => item.id === input.assignmentId && item.workerId === input.workerId)
+    : [...mission.assignments].reverse().find((item) => item.workerId === input.workerId && !isTerminalAssignment(item))
+      ?? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId)
   if (!assignment) return null
   if (assignment.state === 'cancelled' || assignment.state === 'done') return { mission, assignment, changed: false }
 
@@ -532,7 +530,7 @@ export function cancelSwarmAssignment(input: {
     ?? (input.workerId ? [...mission.assignments].reverse().find((item) => item.workerId === input.workerId && !isTerminalAssignment(item)) : null)
     ?? null
   if (!assignment) return null
-  if (assignment.state === 'cancelled') return { mission, assignment, changed: false }
+  if (mission.state === 'complete' || isTerminalAssignment(assignment)) return { mission, assignment, changed: false }
   const cancelledAt = now()
   measureAssignmentTokenUsage(assignment, mission.budget?.tokenLimit ?? null)
   assignment.state = 'cancelled'
@@ -563,6 +561,7 @@ export function cancelSwarmMission(input: {
   const store = readStore()
   const mission = store.missions.find((item) => item.id === input.missionId)
   if (!mission) return null
+  if (mission.state === 'cancelled' || mission.state === 'complete') return { mission, cancelledAssignmentIds: [], changed: false }
   const cancelledAt = now()
   const cancelledAssignmentIds: Array<string> = []
   for (const assignment of mission.assignments) {

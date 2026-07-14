@@ -79,6 +79,7 @@ describe('dispatchSwarmAssignments', () => {
       initiatedBy: 'hermes-desktop',
       returnSessionKey: 'desktop-session-1',
     })
+    expect(result.notifySessionKey).toBe('desktop-session-1')
   })
 })
 

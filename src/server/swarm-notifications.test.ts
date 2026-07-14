@@ -79,6 +79,17 @@ describe('swarm-notifications', () => {
     expect(publishChatEvent).toHaveBeenCalledTimes(4)
   })
 
+  it('deduplicates an assignment checkpoint after another assignment reports', async () => {
+    const { mod, publishChatEvent } = await loadModule()
+    mkdirSync(join(tempRoot, 'builder'), { recursive: true })
+    const checkpoint = { stateLabel: 'DONE' as const, runtimeState: 'idle' as const, checkpointStatus: 'done' as const, filesChanged: 'none', commandsRun: 'pnpm test', result: 'same evidence', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: same evidence' }
+    mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'one', checkpoint, notifySessionKey: 'desktop' })
+    mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'two', checkpoint, notifySessionKey: 'desktop' })
+    const replay = mod.publishSwarmCheckpointNotification({ workerId: 'builder', missionId: 'mission-42', assignmentId: 'one', checkpoint, notifySessionKey: 'desktop' })
+    expect(replay.route).toBe('noop')
+    expect(publishChatEvent).toHaveBeenCalledTimes(4)
+  })
+
   it('publishes checkpoint notifications once per unique raw and persists dedupe state', async () => {
     const { mod, publishChatEvent } = await loadModule()
     const checkpoint = {

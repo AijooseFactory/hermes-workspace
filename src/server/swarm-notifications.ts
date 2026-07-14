@@ -1,5 +1,5 @@
-import { join } from 'node:path'
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import type { ParsedSwarmCheckpoint } from './swarm-checkpoints'
 import { getSwarmProfilePath } from './swarm-foundation'
@@ -94,7 +94,10 @@ function readRuntime(runtimePath: string): Record<string, unknown> {
 }
 
 function writeRuntime(runtimePath: string, value: Record<string, unknown>): void {
-  writeFileSync(runtimePath, JSON.stringify(value, null, 2) + '\n')
+  mkdirSync(dirname(runtimePath), { recursive: true })
+  const tmp = `${runtimePath}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n')
+  renameSync(tmp, runtimePath)
 }
 
 function checkpointSummary(checkpoint: ParsedSwarmCheckpoint): string {
@@ -153,6 +156,9 @@ export function publishSwarmCheckpointNotification(input: {
   const current = readRuntime(runtimePath)
   const currentRaw = typeof current.lastNotifiedCheckpointRaw === 'string' ? current.lastNotifiedCheckpointRaw : null
   const currentSig = typeof current.lastNotifiedCheckpointSignature === 'string' ? current.lastNotifiedCheckpointSignature : null
+  const notifiedSignatures = Array.isArray(current.notifiedCheckpointSignatures)
+    ? current.notifiedCheckpointSignatures.filter((value): value is string => typeof value === 'string')
+    : []
   const checkpointRaw = input.checkpoint.raw?.trim() || ''
   const sessionKey = input.notifySessionKey?.trim() || (typeof current.notifySessionKey === 'string' && current.notifySessionKey.trim()) || MAIN_SESSION_KEY
 
@@ -170,7 +176,7 @@ export function publishSwarmCheckpointNotification(input: {
     checkpointRaw,
   ].join('|')
 
-  if (currentSig && currentSig === checkpointSignature) {
+  if ((currentSig && currentSig === checkpointSignature) || notifiedSignatures.includes(checkpointSignature)) {
     return { published: false, sessionKey, route: 'noop' }
   }
   // Backwards-compat: if no signature was ever stored but raw matches AND nothing else
@@ -224,11 +230,16 @@ export function publishSwarmCheckpointNotification(input: {
     publishedToDesktop = true
   }
 
+  const latest = readRuntime(runtimePath)
+  const latestSignatures = Array.isArray(latest.notifiedCheckpointSignatures)
+    ? latest.notifiedCheckpointSignatures.filter((value): value is string => typeof value === 'string')
+    : notifiedSignatures
   writeRuntime(runtimePath, {
-    ...current,
+    ...latest,
     notifySessionKey: sessionKey,
     lastNotifiedCheckpointRaw: checkpointRaw || null,
     lastNotifiedCheckpointSignature: checkpointSignature,
+    notifiedCheckpointSignatures: [...new Set([...latestSignatures, checkpointSignature])].slice(-50),
     lastNotifiedAt: new Date().toISOString(),
     lastCheckpointRoute: publishedToDesktop ? 'desktop' : 'orchestrator',
     lastOrchestratorSendOk: orchestratorResult.sent,

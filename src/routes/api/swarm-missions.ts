@@ -75,12 +75,14 @@ export const Route = createFileRoute('/api/swarm-missions')({
           ? Array.from(workerIds).map((id) => resetSwarmWorkerRuntime(id, { actor, reason }))
           : []
 
-        publishSwarmCancellationNotification({
-          missionId,
-          assignmentId: 'assignment' in result ? result.assignment.id : null,
-          sessionKey: result.mission.returnSessionKey,
-          reason,
-        })
+        if (result.changed) {
+          publishSwarmCancellationNotification({
+            missionId,
+            assignmentId: 'assignment' in result ? result.assignment.id : null,
+            sessionKey: result.mission.returnSessionKey,
+            reason,
+          })
+        }
 
         return json({
           ok: true,

@@ -52,5 +52,15 @@ describe('POST /api/swarm-missions', () => {
         reason: 'User stopped it',
       }),
     )
+
+    const duplicate = await handlers.POST({
+      request: new Request('http://localhost/api/swarm-missions', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'cancel', missionId: 'mission-cancel-desktop', reason: 'User stopped it' }),
+      }),
+    })
+    expect(duplicate.status).toBe(200)
+    expect(publishSwarmCancellationNotification).toHaveBeenCalledTimes(1)
+    expect(missions.getSwarmMission('mission-cancel-desktop')?.events.filter((event) => event.type === 'mission_cancelled')).toHaveLength(1)
   })
 })

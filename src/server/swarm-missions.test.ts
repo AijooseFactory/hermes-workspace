@@ -172,6 +172,28 @@ con = sqlite3.connect(sys.argv[1]); con.execute('update sessions set input_token
     expect(existsSync(mod.SWARM_MISSIONS_PATH)).toBe(true)
   })
 
+  it('rejects checkpoints routed to an assignment owned by another worker', async () => {
+    const mod = await loadModule()
+    const mission = mod.createOrUpdateMission({
+      missionId: 'mission-worker-routing',
+      title: 'Worker routing',
+      assignments: [
+        { workerId: 'builder', task: 'Build it', reviewRequired: false },
+        { workerId: 'reviewer', task: 'Review it', reviewRequired: false },
+      ],
+    })
+    const result = mod.recordMissionCheckpoint({
+      missionId: mission.id,
+      assignmentId: mission.assignments[0]?.id,
+      workerId: 'reviewer',
+      checkpoint: {
+        stateLabel: 'DONE', runtimeState: 'idle', checkpointStatus: 'done', filesChanged: 'none', commandsRun: 'none', result: 'misrouted', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: misrouted',
+      },
+    })
+    expect(result).toBeNull()
+    expect(mod.getSwarmMission(mission.id)?.events.filter((event) => event.type === 'checkpoint')).toHaveLength(0)
+  })
+
   it('does not infer review-required from dispatch/checkpoint wording alone', async () => {
     const mod = await loadModule()
     const mission = mod.createOrUpdateMission({
@@ -355,6 +377,27 @@ con = sqlite3.connect(sys.argv[1]); con.execute('update sessions set input_token
     expect(cancelled?.mission.state).toBe('planning')
     expect(cancelled?.mission.assignments.map((assignment) => assignment.state)).toEqual(['cancelled', 'queued'])
     expect(cancelled?.mission.events.at(-1)?.type).toBe('assignment_cancelled')
+  })
+
+  it('does not cancel or emit cancellation events for completed work', async () => {
+    const mod = await loadModule()
+    const mission = mod.createOrUpdateMission({
+      missionId: 'mission-complete-cancel',
+      title: 'Completed mission',
+      assignments: [{ workerId: 'builder', task: 'Finish first', reviewRequired: false }],
+    })
+    mod.recordMissionCheckpoint({
+      missionId: mission.id,
+      assignmentId: mission.assignments[0]?.id,
+      workerId: 'builder',
+      checkpoint: { stateLabel: 'DONE', runtimeState: 'idle', checkpointStatus: 'done', filesChanged: 'none', commandsRun: 'none', result: 'done', blocker: null, nextAction: 'none', raw: 'STATE: DONE\nRESULT: done' },
+    })
+
+    expect(mod.cancelSwarmMission({ missionId: mission.id })?.changed).toBe(false)
+    expect(mod.cancelSwarmAssignment({ missionId: mission.id, assignmentId: mission.assignments[0]?.id })?.changed).toBe(false)
+    const persisted = mod.getSwarmMission(mission.id)
+    expect(persisted?.state).toBe('complete')
+    expect(persisted?.events.filter((event) => event.type === 'mission_cancelled' || event.type === 'assignment_cancelled')).toHaveLength(0)
   })
 
   it('archives stale executing missions when all assignments are terminal', async () => {
