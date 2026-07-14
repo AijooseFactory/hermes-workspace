@@ -139,4 +139,22 @@ describe('/api/swarm-runtime/reset', () => {
     expect(body.ok).toBe(false)
     expect(body.error).toContain('unknown worker ids')
   })
+
+  it('resets a safe existing Hermes profile that is not in swarm.yaml', async () => {
+    writeRuntime('junior_software_engineer', { workerId: 'junior_software_engineer', state: 'executing' })
+    const handlers = await loadHandlers()
+    const res = await handlers.POST({ request: new Request('http://localhost/api/swarm-runtime/reset', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workerIds: ['junior_software_engineer'] }),
+    }) })
+    expect(res.status).toBe(200)
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, 'profiles', 'junior_software_engineer', 'runtime.json'), 'utf-8')).state).toBe('idle')
+  })
+
+  it('still rejects traversal-like profile ids', async () => {
+    const handlers = await loadHandlers()
+    const res = await handlers.POST({ request: new Request('http://localhost/api/swarm-runtime/reset', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workerIds: ['../junior_software_engineer'] }),
+    }) })
+    expect(res.status).toBe(400)
+  })
 })
